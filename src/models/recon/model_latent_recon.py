@@ -13,19 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
 from functools import partial
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from einops import rearrange, repeat
 
 from src.models.utils.attention import PatchEmbed3D
-from src.rendering.gs import GaussianRenderer
-from src.rendering.gs_deferred import GaussianRendererDeferred
+from src.models.recon.gaussian_decoder import GaussianDecoder
 
 from src.models.utils.cosmos_1_tokenizer import load_cosmos_1_decoder
-from src.models.utils.render import subsample_pixels_spatio_temporal, query_z_with_indices, subsample_x_and_rays
 from src.models.utils.model import get_model_blocks, ConvTranspose3dFactorized, MultiStageConvTranspose3d, ConvTranspose3dReduced, forward_checkpointing, PositionalEmbedding
 
 class LatentRecon(nn.Module):
@@ -127,17 +123,9 @@ class LatentRecon(nn.Module):
         if self.opt.use_pos_embedding:
             self.pos_embedding = PositionalEmbedding(**self.opt.pos_embedding_kwargs)
         
-        # Output layers
-        self.output_dims = self.opt.output_dims
+        # Gaussian decoder
+        self.gaussian_decoder = GaussianDecoder(self.opt)
 
-        # Learn mask that prunes gaussians
-        if self.opt.sub_sample_gaussians_type == 'learned':
-            self.output_dims += 1
-        
-        # Learn position offsets
-        if self.opt.gaussians_predict_offset:
-            self.output_dims += 3
-        
         # Set transposed conv decoding module
         transposed_conv_kwargs = {}
         if self.opt.transposed_conv_type == 'factorized':
@@ -153,7 +141,7 @@ class LatentRecon(nn.Module):
 
         # Decode into RGB with cosmos decoder or just one deconv
         if self.opt.use_cosmos_decoder:
-            self.opt.decoder_cosmos_kwargs['out_channels'] = self.output_dims
+            self.opt.decoder_cosmos_kwargs['out_channels'] = self.gaussian_decoder.output_dims
             self.decoder_cosmos, tokenizer_config = load_cosmos_1_decoder(self.opt.vae_path, self.opt.decoder_cosmos_kwargs)
             deconv_out_channels = tokenizer_config['channels']
             # Set up new patchification based on cosmos upsampling
@@ -171,27 +159,14 @@ class LatentRecon(nn.Module):
         else:
             if self.opt.use_patch_embeddings_encoder:
                 self.padding_deconv = (self.opt.latent_time_compression//2, 0, 0)
-                self.deconv = transposed_conv_module(self.blocks_out_channels, self.output_dims, self.patch_size_out, stride=self.stride_size_out, padding=self.padding_deconv, **transposed_conv_kwargs)     
+                self.deconv = transposed_conv_module(self.blocks_out_channels, self.gaussian_decoder.output_dims, self.patch_size_out, stride=self.stride_size_out, padding=self.padding_deconv, **transposed_conv_kwargs)
         
         # Initialize weights
         for module_name, module in self.named_children():
             module.apply(self._init_weights)
 
-        # Gaussian renderer
-        if self.opt.deferred_bp:
-            self.gs = GaussianRendererDeferred(opt)
-        else:
-            self.gs = GaussianRenderer(opt)
-
-        # Gaussian misc
-        scale_cap = opt.gaussian_scale_cap
-        scale_shift = 1 - math.log(scale_cap)
-        self.scale_act = lambda x: torch.minimum(torch.exp(x-scale_shift),torch.tensor([scale_cap],device=x.device,dtype=x.dtype))
-        self.opacity_act = lambda x: torch.sigmoid(x-2.0)
-        self.rot_act = lambda x: F.normalize(x, dim=-1)
-        self.rgb_act = lambda x: 0.5 * torch.tanh(x) + 0.5
-        self.dnear = self.opt.dnear
-        self.dfar = self.opt.dfar
+        # Alias for backward compatibility with previous attribute name
+        self.gs = self.gaussian_decoder.renderer
 
     def forward_gaussians(self, images_input, plucker_embedding, rays_os, rays_ds, time_embeddings, num_input_multi_views=None):
         # Compute embeddings per view independently, reshape multi-view from temporal into batch
@@ -247,32 +222,20 @@ class LatentRecon(nn.Module):
         elif self.opt.use_cosmos_decoder:
             x = self.decoder_cosmos(x, gradient_checkpoint=self.opt.gradient_checkpoint_conv)
 
-        # Get predicted subsampling mask
-        if self.opt.sub_sample_gaussians_factor is not None:
-            if self.opt.sub_sample_gaussians_type == 'learned':
-                x, x_mask = x[:, :-1], x[:, [-1]]
-            else:
-                x_mask = None
-
-        # Subsample number of gaussians
-        if self.opt.sub_sample_gaussians and self.opt.sub_sample_gaussians_factor is not None:
-            x = forward_checkpointing(self.subsample_x_and_rays_wrapper, x, rays_os, rays_ds, x_mask, gradient_checkpoint=self.opt.gradient_checkpoint_conv)
-        else:
-            x = rearrange(x, 'b c t h w -> b (t h w) c')
-            rays_os = rearrange(rays_os, 'b t c h w -> b (t h w) c')
-            rays_ds = rearrange(rays_ds, 'b t c h w -> b (t h w) c')
-            x_mask = None
-
-        # Set up gaussian attributes
-        x = forward_checkpointing(self.gaussian_processing, x, rays_os, rays_ds, gradient_checkpoint=self.opt.gradient_checkpoint_conv)
+        gaussians, gaussians_mask = forward_checkpointing(
+            self.gaussian_decoder,
+            x,
+            rays_os,
+            rays_ds,
+            self.training,
+            gradient_checkpoint=self.opt.gradient_checkpoint_conv,
+        )
 
         # Merge viewpoints into one gaussian vector
         if self.opt.fuse_multi_views or not self.training:
-            x = self.reshape_mv_batch_to_temp(x, num_input_multi_views)
-        
-        # Optionally prune gaussians as in Long LRM
-        x = self.gaussian_pruning(x)
-        return x, x_mask
+            gaussians = self.reshape_mv_batch_to_temp(gaussians, num_input_multi_views)
+
+        return gaussians, gaussians_mask
 
     def forward(self, data, skip_loss=False):
 
@@ -294,17 +257,9 @@ class LatentRecon(nn.Module):
         
         # use the first view to predict gaussians
         gaussians, gaussians_mask = self.forward_gaussians(images, plucker_embedding, rays_os, rays_ds, time_embeddings=time_embeddings, num_input_multi_views=num_input_multi_views) # [B, N, 14]
-        
-        # always use white background
-        add_gs_render_kwargs = {}
-        if self.opt.deferred_bp:
-            bg_color = [1, 1, 1]
-            add_gs_render_kwargs = {'patch_size': self.opt.gs_render_patch_size}
-        else:
-            bg_color = torch.ones(3, dtype=gaussians.dtype, device=gaussians.device)     
 
         # render predictions
-        results = self.gs.render(gaussians, cam_view, bg_color=bg_color, intrinsics=intrinsics, **add_gs_render_kwargs)
+        results = self.gaussian_decoder.render(gaussians, cam_view, intrinsics)
         
         # output
         if self.training:
@@ -323,32 +278,6 @@ class LatentRecon(nn.Module):
             out['gaussians_mask_pred'] = gaussians_mask
             out['gaussians'] = gaussians
         return out
-    
-    def gaussian_processing(self, x: torch.Tensor, rays_os: torch.Tensor, rays_ds: torch.Tensor):
-        # Pixel-aligned gaussians
-        if self.opt.gaussians_predict_offset:
-            pos_offset = x[..., -3:]
-            x = x[..., :-3]
-        distance, rgb, scaling, rotation, opacity = x.split([1, 3, 3, 4, 1], dim=-1)   
-        w = torch.sigmoid(distance + self.opt.pre_sigmoid_distance_shift)
-        depths = self.dnear * (1 - w) + self.dfar * w
-        pos = rays_os + rays_ds * depths
-
-        # Add offsets to gaussian positions
-        if self.opt.gaussians_predict_offset and self.opt.use_gaussians_predict_offset:
-            if self.opt.gaussians_predict_offset_act == 'clamp':
-                pos_offset = pos_offset.clamp(self.opt.gaussians_predict_offset_range[0], self.opt.gaussians_predict_offset_range[1])
-            elif self.opt.gaussians_predict_offset_act == 'tanh':
-                pos_offset = self.opt.gaussians_predict_offset_range[1] * torch.tanh(pos_offset)
-            pos = pos + pos_offset
-        
-        # Activations
-        opacity = self.opacity_act(opacity)
-        scale = self.scale_act(scaling)
-        rotation = self.rot_act(rotation)
-        rgbs = self.rgb_act(rgb)
-        gaussians = torch.cat([pos, opacity, scale, rotation, rgbs], dim=-1) # [B, N, 14]
-        return gaussians
     
     def get_time_embedding(self, time_embeddings: torch.Tensor, V: int, num_input_multi_views: int = None):
         # Split into input and target time embeddings
@@ -369,37 +298,6 @@ class LatentRecon(nn.Module):
         x_time_emb_tgt = self.repeat_to_mv(x_time_emb_tgt, num_input_multi_views=num_input_multi_views)
         return x_time_emb, x_time_emb_tgt
     
-    def gaussian_pruning(self, gaussians: torch.Tensor):
-        # Gaussian pruning following Long LRM
-        prune_ratio = self.opt.gaussians_prune_ratio
-        if prune_ratio > 0:
-            opacity = gaussians[:, :, [3]]
-            num_gaussians = gaussians.shape[1]
-            keep_ratio = 1 - prune_ratio
-            random_ratio = self.opt.gaussians_random_ratio
-            random_ratio = keep_ratio * random_ratio
-            keep_ratio = keep_ratio - random_ratio
-            num_keep = int(num_gaussians * keep_ratio)
-            num_keep_random = int(num_gaussians * random_ratio)
-            # rank by opacity
-            idx_sort = opacity.argsort(dim=1, descending=True)
-            keep_idx = idx_sort[:, :num_keep]
-            if num_keep_random > 0:
-                rest_idx = idx_sort[:, num_keep:]
-                random_idx = rest_idx[:, torch.randperm(rest_idx.shape[1])[:num_keep_random]]
-                keep_idx = torch.cat([keep_idx, random_idx], dim=1)
-            gaussians = gaussians.gather(1, keep_idx.expand(-1, -1, gaussians.shape[-1]))
-        return gaussians     
-    
-    def subsample_x_and_rays_wrapper(self, x, rays_os, rays_ds, x_mask):
-        return subsample_x_and_rays(
-            x, rays_os, rays_ds, x_mask,
-            self.opt.sub_sample_gaussians_factor,
-            self.opt.sub_sample_gaussians_type,
-            self.opt.sub_sample_gaussians_type_tokens,
-            self.opt.sub_sample_gaussians_temperature,
-            self.training,
-        )
     
     def _init_weights(self, m):
         from timm.models.layers import trunc_normal_
